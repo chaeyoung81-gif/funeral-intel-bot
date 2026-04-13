@@ -1,0 +1,27 @@
+# 환경변수 (절대 커밋 금지)
+.env
+*.env
+
+# 로컬 데이터 파일
+todos.json
+seen_items.json
+report_state.json
+schedule_chat_ids.json
+
+# 로그
+*.log
+
+# PDF 보고서
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
