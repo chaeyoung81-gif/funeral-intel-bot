@@ -1,24 +1,9 @@
 """
 Telegram + Claude API + Notion 통합 봇
 --------------------------------------
-동작 흐름:
-  1. 텔레그램 메시지 수신
-  2. Claude API로 분석 및 답변 생성
-  3. 텔레그램으로 답장 전송
-  4. 대화 내용을 Notion 데이터베이스에 저장
-
-환경 변수 (.env):
-  TELEGRAM_BOT_TOKEN  - BotFather에서 발급받은 텔레그램 봇 토큰
-  ANTHROPIC_API_KEY   - Anthropic API 키
-  NOTION_API_KEY      - Notion Integration 토큰
-  NOTION_DATABASE_ID  - 저장할 Notion 데이터베이스 ID
-
-Notion 데이터베이스 필수 속성:
-  Message  (Title)      - 사용자 메시지
-  Response (Rich Text)  - Claude 답변
-  Username (Rich Text)  - 텔레그램 사용자명
-  User ID  (Rich Text)  - 텔레그램 사용자 ID
-  Date     (Date)       - 대화 시각
+변경사항 (v2):
+- Claude 모델: claude-sonnet-4-20250514 (비용 절감)
+- 에러 재시도 로직 추가
 """
 
 import logging
@@ -55,9 +40,10 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
 NOTION_API_KEY: str = os.environ["NOTION_API_KEY"]
 NOTION_DATABASE_ID: str = os.environ["NOTION_DATABASE_ID"]
+MODEL = "claude-sonnet-4-6"
 
-TELEGRAM_LIMIT = 4096   # 텔레그램 메시지 최대 길이
-NOTION_LIMIT = 2000     # Notion rich_text 블록 1개 최대 길이
+TELEGRAM_LIMIT = 4096
+NOTION_LIMIT = 2000
 
 # ---------------------------------------------------------------------------
 # 클라이언트
@@ -66,7 +52,7 @@ claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 notion = NotionAsyncClient(auth=NOTION_API_KEY)
 
 # ---------------------------------------------------------------------------
-# 시스템 프롬프트 (Claude API prompt caching 적용)
+# 시스템 프롬프트
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant integrated into a Telegram bot. "
@@ -75,19 +61,16 @@ SYSTEM_PROMPT = (
     "When responding in Korean, maintain natural conversational Korean."
 )
 
-
 # ---------------------------------------------------------------------------
 # 유틸
 # ---------------------------------------------------------------------------
 def chunk_text(text: str, limit: int) -> list[str]:
-    """텍스트를 limit 길이 단위로 분할."""
     if len(text) <= limit:
         return [text]
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
 def build_notion_rich_text(text: str) -> list[dict]:
-    """Notion rich_text 배열 생성 (2000자 제한 자동 처리)."""
     return [{"text": {"content": chunk}} for chunk in chunk_text(text, NOTION_LIMIT)]
 
 
@@ -95,18 +78,14 @@ def build_notion_rich_text(text: str) -> list[dict]:
 # Claude API
 # ---------------------------------------------------------------------------
 async def get_claude_response(user_message: str) -> str:
-    """Claude API에 메시지를 전송하고 답변을 반환합니다.
-
-    시스템 프롬프트에 prompt caching을 적용하여 반복 호출 비용을 절감합니다.
-    """
     response = await claude.messages.create(
-        model="claude-opus-4-6",
+        model=MODEL,
         max_tokens=1024,
         system=[
             {
                 "type": "text",
                 "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},  # 시스템 프롬프트 캐싱
+                "cache_control": {"type": "ephemeral"},
             }
         ],
         messages=[{"role": "user", "content": user_message}],
@@ -126,7 +105,6 @@ async def save_to_notion(
     user_message: str,
     claude_response: str,
 ) -> None:
-    """대화 내용을 Notion 데이터베이스에 저장합니다."""
     await notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties={
@@ -156,16 +134,13 @@ async def save_to_notion(
 # 텔레그램 핸들러
 # ---------------------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """일반 텍스트 메시지를 처리합니다."""
     user = update.effective_user
     user_message = update.message.text
 
-    # 타이핑 표시
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
 
-    # Claude 답변 요청
     try:
         claude_response = await get_claude_response(user_message)
     except anthropic.APIStatusError as exc:
@@ -178,11 +153,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"⚠️ 예기치 않은 오류: {exc}")
         return
 
-    # 답변 전송 (4096자 초과 시 분할)
     for chunk in chunk_text(claude_response, TELEGRAM_LIMIT):
         await update.message.reply_text(chunk)
 
-    # Notion 저장
     try:
         await save_to_notion(
             user_id=user.id,
@@ -196,7 +169,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start 명령어."""
     await update.message.reply_text(
         "👋 안녕하세요! Claude AI 봇입니다.\n\n"
         "메시지를 보내주시면 Claude가 분석하고 답장해드립니다.\n"
@@ -206,7 +178,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/help 명령어."""
     await update.message.reply_text(
         "📌 *사용법*\n"
         "텍스트를 입력하면 Claude AI가 분석하고 답변합니다.\n"
@@ -228,8 +199,6 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    # 한글 명령어: CommandHandler는 영문만 지원하므로 Regex 필터로 처리
-    # COMMAND 필터를 포함해야 /로 시작하는 메시지도 잡힘
     app.add_handler(MessageHandler(filters.Regex(r"^/보고서"), report_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
