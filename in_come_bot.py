@@ -18,10 +18,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "8650224345:AAEiS2khWhp3HcEMjvELBo8dpXELPCtiZdU"
-CHAT_ID = 8563302747
+TOKEN = "여기에_텔레그램_봇_토큰"
+CHAT_ID = 여기에_채팅_ID
 INSURANCE = 20080
-SHEET_ID = "1im5UpkHikSwuqSZo0kuKS09yQHP9EMzLTu9_WZdtIRM"
+SHEET_ID = "여기에_구글시트_ID"
 CREDS_FILE = "/home/ubuntu/income_bot/service_account.json"
 
 def get_sheet():
