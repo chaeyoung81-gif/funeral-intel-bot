@@ -1,17 +1,18 @@
 """
-브리핑 봇 v2 - 3분할 스케줄
+브리핑 봇 v3 - 3분할 스케줄 + 주간 스코어보드
 --------------------------------------
 08:00 KST — 국내 브리핑 (RSS + 업계 소스)
-11:00 KST — 손경제 브리핑 (팟캐스트 목차 + 유튜브 자막 분석)
-         → 실패 시 13:00 재시도, 그래도 없으면 다음날
 18:00 KST — 아시아 브리핑 (일본·중국·대만·홍콩·싱가포르)
          → 수집 0건이면 미전송
+일요일 20:00 KST — 주간 아이디어 다이제스트 (Notion 대화 기반)
+월요일 08:05 KST — 주간 스코어보드 (지난주 수집 통계 + 체크인 연속 일수)
 
 실행:
-    python briefing_bot.py          # 스케줄 모드
-    python briefing_bot.py --now    # 국내 브리핑 즉시 1회
-    python briefing_bot.py --son    # 손경제 즉시 1회
-    python briefing_bot.py --asia   # 아시아 즉시 1회
+    python briefing_bot.py            # 스케줄 모드
+    python briefing_bot.py --now      # 국내 브리핑 즉시 1회
+    python briefing_bot.py --asia     # 아시아 브리핑 즉시 1회
+    python briefing_bot.py --digest   # 주간 다이제스트 즉시 1회
+    python briefing_bot.py --board    # 주간 스코어보드 즉시 1회
 """
 
 import asyncio
@@ -55,6 +56,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 SEEN_FILE = BASE_DIR / "seen_items.json"
+WEEKLY_STATS_FILE = BASE_DIR / "weekly_stats.json"
+CHECKIN_STATE_FILE = BASE_DIR / "checkin_state.json"
 SEEN_MAX_DAYS = 30
 
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -63,23 +66,9 @@ ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
 NOTION_API_KEY: str = os.environ["NOTION_API_KEY"]
 NOTION_BRIEFING_DB_ID: str = os.environ["NOTION_BRIEFING_DB_ID"]
 
-# 손경제 유튜브 채널
-YOUTUBE_CHANNEL_URL: str = os.getenv(
-    "YOUTUBE_CHANNEL_URL",
-    "https://www.youtube.com/@손경제/videos",
-)
-
-# 손경제 유튜브 — 2개 소스로 수집 (본방 + 플러스 모두 잡기)
-YOUTUBE_CHANNEL_URL: str = os.getenv(
-    "YOUTUBE_CHANNEL_URL",
-    "https://www.youtube.com/@손경제/videos",
-)
-# 본방 검색 키워드 (yt-dlp search)
-YOUTUBE_SEARCH_MAIN: str = "ytsearch5:[손경제] 깊이있는 경제뉴스"
-
 TELEGRAM_LIMIT = 4096
 NOTION_LIMIT = 1900
-MODEL = "claude-sonnet-4-6"  # Sonnet으로 통일 (비용 절감)
+MODEL = "claude-sonnet-4-6"
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -96,6 +85,15 @@ NEWS_KEYWORDS = [
 BOK_KEYWORDS = [
     "장례", "고령화", "초고령화", "인구", "사망", "시니어", "상속",
     "1인가구", "경제전망", "지역경제", "소비", "인구구조",
+]
+
+# 구글 뉴스 검색 쿼리 그룹 — 주제별로 나눠서 노이즈 줄임
+DOMESTIC_NEWS_QUERIES: list[tuple[str, str]] = [
+    ("장례·웰다잉", "장례 OR 납골 OR 화장장 OR 호스피스 OR 웰다잉 OR 봉안 OR 연명의료 OR 장례지도사 OR 추모"),
+    ("고령화·인구", "고령화 OR 초고령화 OR 1인가구 OR 고독사 OR 무연고 OR 인구절벽 OR 시니어"),
+    ("상조·돌봄", "상조 OR 요양 OR 돌봄 OR 간병 OR 노인복지"),
+    ("상속·법제도", "상속 OR 유언 OR 사전장례 OR 상속세"),
+    ("사망 통계", "사망자수 OR 사망률 OR 인구동향"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -184,10 +182,6 @@ def extract_tags(data: dict[str, list[dict]], keywords: str) -> list[str]:
     for tag, kw_list in TAG_RULES:
         if any(kw.lower() in text_pool.lower() for kw in kw_list):
             tags.append(tag)
-    all_sources = {item.get("source", "") for items in data.values() for item in items}
-    if any("유튜브" in s or "손경제" in s for s in all_sources):
-        if "손경제" not in tags:
-            tags.append("손경제")
     return tags[:10]
 
 
@@ -239,6 +233,58 @@ def dedup(items: list[dict], seen: set[str]) -> tuple[list[dict], set[str]]:
 
 
 # ---------------------------------------------------------------------------
+# 주간 통계 관리 (스코어보드용)
+# ---------------------------------------------------------------------------
+def load_weekly_stats() -> dict:
+    """주간 통계 로드. 파일 없으면 새로 생성."""
+    if WEEKLY_STATS_FILE.exists():
+        try:
+            return json.loads(WEEKLY_STATS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "week_start": datetime.now(KST).strftime("%Y-%m-%d"),
+        "domestic_items": 0,
+        "asia_items": 0,
+        "briefing_days": 0,
+    }
+
+
+def update_weekly_stats(domestic: int = 0, asia: int = 0) -> None:
+    """주간 통계 업데이트. 브리핑 발송 후 호출."""
+    stats = load_weekly_stats()
+    stats["domestic_items"] += domestic
+    stats["asia_items"] += asia
+    stats["briefing_days"] += 1
+    WEEKLY_STATS_FILE.write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def reset_weekly_stats() -> None:
+    """새 주 시작 시 호출. 통계 초기화."""
+    stats = {
+        "week_start": datetime.now(KST).strftime("%Y-%m-%d"),
+        "domestic_items": 0,
+        "asia_items": 0,
+        "briefing_days": 0,
+    }
+    WEEKLY_STATS_FILE.write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_checkin() -> dict:
+    """체크인 상태 파일 읽기 (checkin_bot.py가 관리, 여기서는 read-only)."""
+    if not CHECKIN_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(CHECKIN_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # 수집기 1: RSS
 # ---------------------------------------------------------------------------
 def collect_rss(
@@ -272,7 +318,7 @@ def collect_rss(
 
 
 # ---------------------------------------------------------------------------
-# 수집기 2: 게시판 크롤링 (개선 - bbs/list 패턴만 허용)
+# 수집기 2: 게시판 크롤링 (bbs/list 패턴만 허용)
 # ---------------------------------------------------------------------------
 def crawl_board(url: str, source: str, max_items: int = 10) -> list[dict]:
     try:
@@ -280,7 +326,6 @@ def crawl_board(url: str, source: str, max_items: int = 10) -> list[dict]:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 게시판 글 링크 패턴 (bbs, board, view, detail 등)
         board_patterns = ["bbs", "board", "view", "detail", "notice", "press", "news"]
 
         candidate_selectors = [
@@ -309,10 +354,8 @@ def crawl_board(url: str, source: str, max_items: int = 10) -> list[dict]:
             if href and not href.startswith("http"):
                 href = urljoin(url, href)
 
-            # 고정 메뉴 페이지 제외 (contents_view 패턴)
             if "contents_view" in href or "contents/contents" in href:
                 continue
-            # 게시판 글인지 확인 (최소한 URL에 숫자 ID가 있어야 함)
             if href and not any(p in href.lower() for p in board_patterns):
                 continue
 
@@ -329,193 +372,7 @@ def crawl_board(url: str, source: str, max_items: int = 10) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 수집기 3: 유튜브 자막 추출
-# ---------------------------------------------------------------------------
-def _parse_vtt(text: str) -> str:
-    lines = text.splitlines()
-    result = []
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("WEBVTT") or "-->" in line:
-            continue
-        if re.match(r"^\d+$", line):
-            continue
-        line = re.sub(r"<[^>]+>", "", line)
-        if line:
-            result.append(line)
-    deduped = []
-    for line in result:
-        if not deduped or line != deduped[-1]:
-            deduped.append(line)
-    return " ".join(deduped)
-
-
-def _parse_json3(text: str) -> str:
-    try:
-        data = json.loads(text)
-        parts = []
-        for event in data.get("events", []):
-            for seg in event.get("segs", []):
-                utf8 = seg.get("utf8", "")
-                if utf8 and utf8 != "\n":
-                    parts.append(utf8)
-        return re.sub(r"\s+", " ", "".join(parts)).strip()
-    except Exception:
-        return ""
-
-
-def _fetch_subtitle(sub_list: list[dict]) -> str:
-    priority = ["vtt", "json3", "srv3", "ttml"]
-    ordered = sorted(sub_list, key=lambda x: priority.index(x.get("ext", "")) if x.get("ext", "") in priority else 99)
-    for sub in ordered[:3]:
-        url = sub.get("url", "")
-        if not url:
-            continue
-        try:
-            resp = requests.get(url, timeout=15, headers=HTTP_HEADERS)
-            ext = sub.get("ext", "")
-            text = _parse_json3(resp.text) if ext == "json3" else _parse_vtt(resp.text)
-            if text:
-                return text
-        except Exception as e:
-            log.warning(f"[YouTube] 자막 다운로드 실패 ({ext}): {e}")
-    return ""
-
-
-def collect_youtube(channel_url: str, max_videos: int = 3) -> list[dict]:
-    """yt-dlp로 채널 최신 영상의 제목 + 한국어 자막 수집."""
-    try:
-        import yt_dlp
-        flat_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 10}
-
-        def get_video_entries(url: str) -> list[dict]:
-            with yt_dlp.YoutubeDL(flat_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    return []
-                entries = info.get("entries") or []
-                video_entries = []
-                for e in entries:
-                    eid = e.get("id", "")
-                    if not eid:
-                        continue
-                    if eid.startswith("PL") or eid.startswith("RD"):
-                        log.info(f"  [YouTube] 플레이리스트 확장: {eid}")
-                        pl_url = f"https://www.youtube.com/playlist?list={eid}"
-                        with yt_dlp.YoutubeDL(flat_opts) as ydl2:
-                            pl_info = ydl2.extract_info(pl_url, download=False)
-                            if pl_info:
-                                for ve in (pl_info.get("entries") or []):
-                                    vid = ve.get("id", "")
-                                    if vid and not vid.startswith("PL"):
-                                        video_entries.append(ve)
-                    else:
-                        video_entries.append(e)
-                return video_entries
-
-        video_entries = get_video_entries(channel_url)
-        if not video_entries:
-            log.warning(f"[YouTube] 수집 가능한 영상 없음: {channel_url}")
-            return []
-
-        log.info(f"  [YouTube] 후보 영상 {len(video_entries)}개 발견")
-        videos = []
-        detail_opts = {"quiet": True, "no_warnings": True}
-
-        for entry in video_entries[:max_videos]:
-            vid_id = entry.get("id", "")
-            if not vid_id:
-                continue
-            try:
-                with yt_dlp.YoutubeDL(detail_opts) as ydl:
-                    vid = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=False)
-                    title = vid.get("title", entry.get("title", ""))
-                    subtitles = vid.get("subtitles") or {}
-                    auto_caps = vid.get("automatic_captions") or {}
-
-                    sub_text = ""
-                    for lang in ["ko", "en"]:
-                        sub_list = subtitles.get(lang) or auto_caps.get(lang) or []
-                        if sub_list:
-                            sub_text = _fetch_subtitle(sub_list)
-                            if sub_text:
-                                break
-
-                    # 손경제 상세 분석용: 자막 제한 해제 (최대 8000자)
-                    content = sub_text[:8000] if sub_text else (vid.get("description") or "")[:800]
-                    # 목차 (영상 설명란) — 항상 수집
-                    description = (vid.get("description") or "")[:1500]
-
-                    videos.append({
-                        "source": "손경제 유튜브",
-                        "title": title,
-                        "summary": content.strip(),
-                        "description": description.strip(),
-                        "link": f"https://www.youtube.com/watch?v={vid_id}",
-                        "published": vid.get("upload_date", ""),
-                        "has_subtitle": bool(sub_text),
-                    })
-                    log.info(f"  [YouTube] '{title[:40]}' — {'자막' if sub_text else '설명란'} 수집")
-            except Exception as e:
-                log.warning(f"[YouTube] 영상 상세 실패 ({vid_id}): {e}")
-
-        return videos
-    except ImportError:
-        log.warning("[YouTube] yt-dlp 미설치")
-        return []
-    except Exception as e:
-        log.error(f"[YouTube] 수집 실패: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# 수집기 4: 팟캐스트 에피소드 목차 (podtail에서 수집)
-# ---------------------------------------------------------------------------
-def collect_podcast_episodes(max_episodes: int = 5) -> list[dict]:
-    """podtail에서 손경제 팟캐스트 에피소드 목차 텍스트 수집."""
-    try:
-        resp = requests.get(PODCAST_URL, headers=HTTP_HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        episodes = []
-        # podtail 에피소드 블록 파싱
-        for block in soup.select(".episode-list-item, .episode"):
-            title_tag = block.select_one("h3, .episode-title, a[href*='podcast']")
-            if not title_tag:
-                continue
-            title = title_tag.get_text(strip=True)
-
-            # 커피타임, 협찬 등 제외
-            if "커피타임" in title or "협찬" in title:
-                continue
-
-            # 에피소드 설명 (목차 텍스트)
-            desc_tag = block.select_one(".episode-description, .description, p")
-            description = desc_tag.get_text(strip=True) if desc_tag else ""
-
-            link_tag = title_tag if title_tag.name == "a" else block.select_one("a")
-            link = link_tag.get("href", "") if link_tag else ""
-            if link and not link.startswith("http"):
-                link = urljoin(PODCAST_URL, link)
-
-            episodes.append({
-                "title": title,
-                "description": description[:1000],
-                "link": link,
-            })
-            if len(episodes) >= max_episodes:
-                break
-
-        log.info(f"[Podcast] {len(episodes)}개 에피소드 수집")
-        return episodes
-    except Exception as e:
-        log.error(f"[Podcast] 수집 실패: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# 수집기 5: 아시아 장례·고령화 뉴스
+# 수집기 3: 아시아 장례·고령화 뉴스
 # ---------------------------------------------------------------------------
 def collect_asia() -> list[dict]:
     """일본·중국·대만·홍콩·싱가포르의 장례·고령화 관련 뉴스 수집."""
@@ -523,7 +380,6 @@ def collect_asia() -> list[dict]:
 
     # --- 일본 ---
     jp_keywords = ["葬", "死亡", "高齢", "超高齢", "人口", "相続", "終活", "墓", "火葬"]
-    # 후생노동성 RSS
     for mhlw_url in ["https://www.mhlw.go.jp/index.xml", "https://www.mhlw.go.jp/rss/news.xml"]:
         try:
             feed = feedparser.parse(mhlw_url, request_headers=HTTP_HEADERS)
@@ -538,7 +394,6 @@ def collect_asia() -> list[dict]:
         except Exception as e:
             log.warning(f"[아시아] 후생노동성 실패: {e}")
 
-    # 일본 구글뉴스
     jp_queries = ["葬儀 高齢化 2026", "終活 日本", "火葬場 不足"]
     for query in jp_queries:
         try:
@@ -556,7 +411,6 @@ def collect_asia() -> list[dict]:
         except Exception as e:
             log.warning(f"[아시아] 일본 검색 실패 ({query}): {e}")
 
-    # --- 중국 ---
     cn_queries = ["殡葬改革 2026", "中国 老龄化 人口", "中国 丧葬 养老"]
     for query in cn_queries:
         try:
@@ -574,7 +428,6 @@ def collect_asia() -> list[dict]:
         except Exception as e:
             log.warning(f"[아시아] 중국 검색 실패 ({query}): {e}")
 
-    # --- 대만 ---
     tw_queries = ["台灣 殯葬 高齡化", "Taiwan funeral aging"]
     for query in tw_queries:
         try:
@@ -593,7 +446,6 @@ def collect_asia() -> list[dict]:
         except Exception as e:
             log.warning(f"[아시아] 대만 검색 실패: {e}")
 
-    # --- 홍콩 ---
     hk_queries = ["Hong Kong funeral columbarium", "香港 殯葬 骨灰 龕位"]
     for query in hk_queries:
         try:
@@ -612,7 +464,6 @@ def collect_asia() -> list[dict]:
         except Exception as e:
             log.warning(f"[아시아] 홍콩 검색 실패: {e}")
 
-    # --- 싱가포르 ---
     sg_queries = ["Singapore funeral aging population", "Singapore death care elderly"]
     for query in sg_queries:
         try:
@@ -638,7 +489,6 @@ def collect_asia() -> list[dict]:
 #  시스템 프롬프트
 # ═══════════════════════════════════════════════════════════════════════════
 
-# --- 08:00 국내 브리핑용 ---
 SYSTEM_DOMESTIC = """당신은 채영님의 장례사업 전문 브리핑 어시스턴트입니다.
 
 채영님은 장례 '기술자'가 아니라, 장례 산업을 운용·플랫폼화하는 사업가입니다.
@@ -701,53 +551,7 @@ SYSTEM_DOMESTIC = """당신은 채영님의 장례사업 전문 브리핑 어시
 핵심 요약 3줄 이내.
 </SUMMARY>"""
 
-# --- 11:00 손경제 브리핑용 ---
-SYSTEM_SONECONOMY = """당신은 채영님의 장례사업 전문 브리핑 어시스턴트입니다.
 
-채영님은 장례 산업을 운용·플랫폼화하는 사업가입니다.
-손에 잡히는 경제(손경제)는 채영님에게 매우 중요한 프로그램입니다.
-장례 뉴스뿐 아니라 모든 경제 이슈에서 직간접적 사업 아이디어를 얻기 때문입니다.
-예: 요양보호사 대란 → 장례지도사 자격증 남발 흐름 감지
-예: AI 이슈 → 장례 플랫폼 자동화 아이디어
-예: 부동산 → 장례식장 입지 전략
-
-자동자막 오류 가능성을 감안하고, 맥락상 올바른 용어로 보정하세요.
-
-응답 형식:
-
-<BRIEFING>
-🎙️ 손경제 브리핑 [날짜]
-
-(에피소드별로 아래 형식 반복. [손경제] 본방을 먼저, [플러스]를 뒤에 배치.)
-
-━━━━━━━━━━━━━━━━━━━━━━
-📌 [손경제 또는 손경제플러스] 에피소드 제목
-━━━━━━━━━━━━━━━━━━━━━━
-
-📎 방송 목차:
-(제공된 '방송 목차' 텍스트를 그대로 포함. 뉴스 항목, 코너명, 출연자 등.)
-
-📋 방송 내용 상세 요약
-(2000~3000자. 방송 흐름 따라 핵심 논점별로 정리.
-숫자·통계·전문가 발언 포함. 생략 없이 충실하게.
-목차의 각 항목별로 구체적 내용을 풀어서 설명.)
-
-💡 장례사업 관점 제언
-(방송 내용에서 장례 산업과 직간접적으로 연결되는 포인트.
-연결이 자연스러운 것만. 억지 연결 금지.
-연결 포인트가 없으면 "직접 연결 포인트 없음"으로 표기하되,
-사업가 관점에서 참고할 거시적 시사점은 언급.)
-</BRIEFING>
-
-<KEYWORDS>
-핵심 키워드 3~5개.
-</KEYWORDS>
-
-<SUMMARY>
-핵심 요약 3줄 이내.
-</SUMMARY>"""
-
-# --- 18:00 아시아 브리핑용 ---
 SYSTEM_ASIA = """당신은 채영님의 장례사업 전문 브리핑 어시스턴트입니다.
 
 채영님은 장례 산업을 운용·플랫폼화하는 사업가입니다.
@@ -874,7 +678,7 @@ async def send_telegram(text: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Claude 분석 공통
+#  Claude 응답 파싱
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _extract_tag(tag: str, text: str) -> str:
@@ -897,21 +701,22 @@ async def collect_domestic() -> dict[str, list[dict]]:
     seen = load_seen()
     log.info(f"[seen] 기존 기록 {len(seen)}개 로드")
 
+    # 구글 뉴스 검색 (주제 그룹별)
+    google_news_tasks = [
+        run(collect_rss,
+            f"https://news.google.com/rss/search?q={quote(query)}&hl=ko&gl=KR&ceid=KR:ko",
+            f"구글뉴스·{label}", None, 10)
+        for label, query in DOMESTIC_NEWS_QUERIES
+    ]
+
     results = await asyncio.gather(
-        # 뉴스 RSS
-        run(collect_rss, "https://www.hani.co.kr/rss/", "한겨레", NEWS_KEYWORDS),
-        run(collect_rss, "https://www.chosun.com/arc/outboundfeeds/rss/?outputType=xml", "조선일보", NEWS_KEYWORDS),
-        run(collect_rss, "https://www.mk.co.kr/rss/30000001/", "매일경제", NEWS_KEYWORDS),
-        run(collect_rss, "https://www.hankyung.com/feed/all-news", "한국경제", NEWS_KEYWORDS),
-        run(collect_rss, "https://rss.joins.com/joins_news_list.xml", "중앙일보", NEWS_KEYWORDS),
-        # 기관 게시판
+        *google_news_tasks,
         run(crawl_board, "https://www.kfcpi.or.kr/portal/home/bbs/list.do?menuId=M0001000600010000", "한국장례문화진흥원"),
         run(crawl_board, "https://www.kfcpi.or.kr/portal/home/bbs/list.do?menuId=M0001000700000000", "장례문화진흥원 보도자료"),
         run(crawl_board, "https://www.bok.or.kr/portal/bbs/P0000559/list.do?menuNo=200690", "한국은행"),
         run(crawl_board, "https://www.sangjomagazine.com", "상조매거진"),
         run(crawl_board, "https://kfda1024.or.kr/", "대한장례지도사협회"),
         run(crawl_board, "https://www.mohw.go.kr/board.es?mid=a10503010100&bid=0027", "보건복지부"),
-        # 통계 — KOSIS RSS + 구글뉴스로 통계청 발표 잡기
         run(collect_rss,
             "https://news.google.com/rss/search?q=" + quote("통계청 OR 국가데이터처 인구동향 사망자수") + "&hl=ko&gl=KR&ceid=KR:ko",
             "통계청 발표", None, 5),
@@ -921,21 +726,26 @@ async def collect_domestic() -> dict[str, list[dict]]:
         return_exceptions=True,
     )
 
-    keys = ["hani", "chosun", "mk", "hankyung", "joins",
-            "kfcpi", "kfcpi_press", "bok",
-            "sangjo_mag", "kfda", "mohw",
-            "kostat_news", "kosis_news"]
+    google_news_keys = [f"news_{label}" for label, _ in DOMESTIC_NEWS_QUERIES]
+    other_keys = ["kfcpi", "kfcpi_press", "bok",
+                  "sangjo_mag", "kfda", "mohw",
+                  "kostat_news", "kosis_news"]
+    keys = google_news_keys + other_keys
     parsed = {k: (v if isinstance(v, list) else []) for k, v in zip(keys, results)}
 
-    # 에러 로깅
     for k, v in zip(keys, results):
         if isinstance(v, Exception):
             log.error(f"[수집 에러:{k}] {v}")
 
     bok_filtered = [i for i in parsed["bok"] if any(kw in i["title"] for kw in BOK_KEYWORDS)]
 
+    # 구글 뉴스 결과를 모두 합쳐 'news' 카테고리로
+    news_items: list[dict] = []
+    for k in google_news_keys:
+        news_items.extend(parsed[k])
+
     raw: dict[str, list[dict]] = {
-        "news": parsed["hani"] + parsed["chosun"] + parsed["mk"] + parsed["hankyung"] + parsed["joins"],
+        "news": news_items,
         "funeral_orgs": parsed["kfcpi"] + parsed["kfcpi_press"] + parsed["sangjo_mag"] + parsed["kfda"],
         "gov": bok_filtered + parsed["mohw"] + parsed["kostat_news"] + parsed["kosis_news"],
     }
@@ -951,7 +761,6 @@ async def collect_domestic() -> dict[str, list[dict]]:
     for key, items in data.items():
         log.info(f"  [{key}] {len(items)}건 (신규)")
 
-    # 수집 현황 모니터링
     total = sum(len(v) for v in data.values())
     if total == 0:
         log.warning("⚠️ 국내 브리핑: 신규 수집 0건!")
@@ -1004,7 +813,6 @@ async def run_domestic() -> None:
 
             await send_telegram(briefing_text)
 
-            # 원문 링크 모음
             all_items = data["news"] + data["funeral_orgs"] + data["gov"]
             links_lines = ["📎 원문 링크"]
             for item in all_items:
@@ -1022,6 +830,12 @@ async def run_domestic() -> None:
             except Exception as e:
                 log.error(f"[Notion] 저장 실패: {e}")
 
+        # 주간 통계 업데이트
+        try:
+            update_weekly_stats(domestic=total, asia=0)
+        except Exception as e:
+            log.warning(f"[stats] 업데이트 실패: {e}")
+
     except Exception as e:
         log.error(f"국내 브리핑 실패: {e}", exc_info=True)
         try:
@@ -1033,117 +847,7 @@ async def run_domestic() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  작업 2: 11:00 손경제 브리핑
-# ═══════════════════════════════════════════════════════════════════════════
-
-async def run_soneconomy(is_retry: bool = False) -> bool:
-    """손경제 브리핑. 성공 시 True, 수집 실패 시 False."""
-    log.info(f"=== 손경제 브리핑 {'(재시도)' if is_retry else ''} 시작 ===")
-    today_str = datetime.now(KST).strftime("%Y-%m-%d")
-    date_kor = datetime.now(KST).strftime("%Y.%m.%d")
-    day_kor = ["월", "화", "수", "목", "금", "토", "일"][datetime.now(KST).weekday()]
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        # 소스 1: 채널에서 플러스 수집
-        channel_vids = await loop.run_in_executor(None, collect_youtube, YOUTUBE_CHANNEL_URL, 10)
-        # 소스 2: 검색으로 [손경제] 본방 수집
-        search_vids = await loop.run_in_executor(None, collect_youtube, YOUTUBE_SEARCH_MAIN, 5)
-
-        # 합치고 중복 제거 (영상 ID 기준)
-        seen_ids = set()
-        youtube_vids = []
-        for v in search_vids + channel_vids:
-            vid_id = v.get("link", "").split("v=")[-1] if "v=" in v.get("link", "") else ""
-            if vid_id and vid_id not in seen_ids:
-                seen_ids.add(vid_id)
-                youtube_vids.append(v)
-
-        # 커피타임·협찬 제외
-        youtube_vids = [v for v in youtube_vids
-                        if "커피타임" not in v.get("title", "")
-                        and "협찬" not in v.get("title", "")]
-
-        # 최근 3일 이내 영상 필터
-        date_cutoff = [(datetime.now(KST) - timedelta(days=i)).strftime("%Y%m%d") for i in range(3)]
-        today_vids = [v for v in youtube_vids
-                      if v.get("published", "").replace("-", "") in date_cutoff]
-
-        # [손경제]와 [플러스] 분리
-        son_main = [v for v in today_vids if "[손경제]" in v.get("title", "") and "플러스" not in v.get("title", "")]
-        son_plus = [v for v in today_vids if v not in son_main]
-        today_vids = son_main + son_plus  # 본방 먼저, 플러스 뒤에
-
-        log.info(f"손경제: 본방 {len(son_main)}건, 플러스 {len(son_plus)}건")
-
-        # 최대 4개로 제한 (본방 최대 2개 + 플러스 최대 2개)
-        today_vids = son_main[:2] + son_plus[:2]
-
-        if not today_vids and not is_retry:
-            log.info("손경제: 오늘/어제 영상 없음 → 13시에 재시도")
-            return False
-
-        if not today_vids:
-            # 재시도에서도 없으면 가장 최근 영상 사용
-            today_vids = youtube_vids[:3] if youtube_vids else []
-
-        if not today_vids:
-            log.info("손경제: 수집 가능한 영상 없음")
-            return True  # 더 이상 재시도 불필요
-
-        # Claude 분석용 데이터 구성
-        sections = []
-        for v in today_vids:
-            tag = "(자막)" if v.get("has_subtitle") else "(설명란)"
-            desc = v.get("description", "")
-            section = f"제목: {v['title']}\n링크: {v['link']}"
-            if desc:
-                section += f"\n📌 방송 목차:\n{desc}"
-            section += f"\n내용 {tag}:\n{v['summary'][:6000]}"
-            sections.append(section)
-
-        raw_data = "\n\n---\n\n".join(sections)
-        prompt = f"오늘({date_kor} {day_kor}요일) 손경제 방송 내용을 분석해주세요.\n\n{raw_data}"
-
-        full_text = await claude_with_retry(prompt, SYSTEM_SONECONOMY, max_tokens=4096)
-        briefing_text = _extract_tag("BRIEFING", full_text) or full_text
-        keywords = _extract_tag("KEYWORDS", full_text)
-        summary = _extract_tag("SUMMARY", full_text)
-
-        await send_telegram(briefing_text)
-        log.info("[Telegram] 손경제 브리핑 전송 완료")
-
-        return True
-
-    except Exception as e:
-        log.error(f"손경제 브리핑 실패: {e}", exc_info=True)
-        try:
-            await send_telegram(f"⚠️ 손경제 브리핑 생성 중 오류: {e}")
-        except Exception:
-            pass
-        return True  # 에러는 재시도 불필요
-
-
-# 11시 → 실패 시 13시 재시도 관리
-_soneconomy_done = False
-
-
-async def run_soneconomy_11() -> None:
-    global _soneconomy_done
-    _soneconomy_done = await run_soneconomy(is_retry=False)
-
-
-async def run_soneconomy_13() -> None:
-    global _soneconomy_done
-    if not _soneconomy_done:
-        _soneconomy_done = await run_soneconomy(is_retry=True)
-    else:
-        log.info("손경제: 11시에 이미 완료 → 13시 스킵")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  작업 3: 18:00 아시아 브리핑
+#  작업 2: 18:00 아시아 브리핑
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def run_asia() -> None:
@@ -1183,7 +887,6 @@ async def run_asia() -> None:
 
         await send_telegram(briefing_text)
 
-        # 원문 링크 모음 전송
         links_lines = ["📎 원문 링크"]
         for item in items:
             if item.get("link"):
@@ -1194,12 +897,18 @@ async def run_asia() -> None:
         log.info("[Telegram] 아시아 브리핑 전송 완료")
 
         try:
-            data = {"asia": items}
-            tags = ["해외동향"] + extract_tags(data, keywords)
-            await save_to_notion(today_str, keywords, briefing_text, data, tags[:10], "아시아")
+            briefing_data = {"asia": items}
+            tags = ["해외동향"] + extract_tags(briefing_data, keywords)
+            await save_to_notion(today_str, keywords, briefing_text, briefing_data, tags[:10], "아시아")
             log.info("[Notion] 아시아 저장 완료")
         except Exception as e:
             log.error(f"[Notion] 아시아 저장 실패: {e}")
+
+        # 주간 통계 업데이트
+        try:
+            update_weekly_stats(domestic=0, asia=len(items))
+        except Exception as e:
+            log.warning(f"[stats] 업데이트 실패: {e}")
 
     except Exception as e:
         log.error(f"아시아 브리핑 실패: {e}", exc_info=True)
@@ -1208,7 +917,7 @@ async def run_asia() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  작업 4: 일요일 20:00 주간 아이디어 다이제스트
+#  작업 3: 일요일 20:00 주간 아이디어 다이제스트
 # ═══════════════════════════════════════════════════════════════════════════
 
 NOTION_CONV_DB_ID: str = os.environ.get("NOTION_DATABASE_ID", "")
@@ -1255,7 +964,6 @@ async def run_weekly_digest() -> None:
         since = datetime.now(timezone.utc) - timedelta(days=7)
         since_str = since.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # 노션 대화 DB 조회
         import httpx
         headers = {
             "Authorization": f"Bearer {NOTION_API_KEY}",
@@ -1277,7 +985,6 @@ async def run_weekly_digest() -> None:
             log.info("주간 다이제스트: 지난 7일 대화 없음")
             return
 
-        # 페이지 텍스트 추출
         conv_texts = []
         for p in pages:
             props = p.get("properties", {})
@@ -1299,7 +1006,6 @@ async def run_weekly_digest() -> None:
         if len(conv_block) > 20000:
             conv_block = conv_block[:20000] + "\n...(이하 생략)"
 
-        # 기간 표시
         today = datetime.now(KST)
         week_start = (today - timedelta(days=7)).strftime("%m.%d")
         week_end = today.strftime("%m.%d")
@@ -1320,6 +1026,55 @@ async def run_weekly_digest() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  작업 4: 월요일 08:05 주간 스코어보드
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run_scoreboard() -> None:
+    """매주 월요일 08:05 — 지난주 수집 통계와 체크인 연속 일수 발송."""
+    log.info("=== 주간 스코어보드 시작 ===")
+    try:
+        stats = load_weekly_stats()
+        week_start = stats.get("week_start", "")
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+
+        domestic = stats.get("domestic_items", 0)
+        asia = stats.get("asia_items", 0)
+        total_items = domestic + asia
+        days = stats.get("briefing_days", 0)
+
+        # 체크인 연속 일수 (checkin_bot.py에서 관리)
+        checkin = load_checkin()
+        streak = checkin.get("streak", 0)
+
+        scoreboard = (
+            f"📊 지난주 인텔리전스 스코어보드\n"
+            f"{week_start} ~ {today}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🇰🇷 국내 수집: {domestic}건\n"
+            f"🌏 아시아 수집: {asia}건\n"
+            f"📦 총 수집: {total_items}건\n"
+            f"📨 브리핑 발송: {days}일\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔥 체크인 연속: {streak}일\n"
+        )
+
+        await send_telegram(scoreboard)
+        log.info("[Telegram] 주간 스코어보드 전송 완료")
+
+        # 통계 초기화 (새 주 시작)
+        reset_weekly_stats()
+
+    except Exception as e:
+        log.error(f"주간 스코어보드 실패: {e}", exc_info=True)
+        try:
+            await send_telegram(f"⚠️ 주간 스코어보드 생성 중 오류: {e}")
+        except Exception:
+            pass
+
+    log.info("=== 주간 스코어보드 완료 ===")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  스케줄러 / 메인
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1331,12 +1086,6 @@ async def main() -> None:
     scheduler.add_job(run_domestic, trigger="cron", hour=8, minute=0,
                       id="domestic", name="08:00 국내 브리핑", misfire_grace_time=300)
 
-    scheduler.add_job(run_soneconomy_11, trigger="cron", hour=11, minute=0,
-                      id="son_11", name="11:00 손경제 브리핑", misfire_grace_time=300)
-
-    scheduler.add_job(run_soneconomy_13, trigger="cron", hour=13, minute=0,
-                      id="son_13", name="13:00 손경제 재시도", misfire_grace_time=300)
-
     scheduler.add_job(run_asia, trigger="cron", hour=18, minute=0,
                       id="asia", name="18:00 아시아 브리핑", misfire_grace_time=300)
 
@@ -1344,9 +1093,13 @@ async def main() -> None:
     scheduler.add_job(run_weekly_digest, trigger="cron", day_of_week="sun", hour=20, minute=0,
                       id="digest", name="일요일 20:00 주간 다이제스트", misfire_grace_time=300)
 
+    # 매주 월요일 08:05 KST 주간 스코어보드
+    scheduler.add_job(run_scoreboard, trigger="cron", day_of_week="mon", hour=8, minute=5,
+                      id="scoreboard", name="월요일 08:05 주간 스코어보드", misfire_grace_time=300)
+
     scheduler.start()
-    log.info("브리핑 봇 v2 시작")
-    log.info(f"  08:00 국내 | 11:00 손경제 | 13:00 재시도 | 18:00 아시아 | 일 20:00 다이제스트")
+    log.info("브리핑 봇 v3 시작")
+    log.info("  08:00 국내 | 18:00 아시아 | 일 20:00 다이제스트 | 월 08:05 스코어보드")
 
     try:
         await asyncio.Event().wait()
@@ -1361,14 +1114,14 @@ if __name__ == "__main__":
     if "--now" in sys.argv:
         log.info("즉시 실행: 국내 브리핑")
         asyncio.run(run_domestic())
-    elif "--son" in sys.argv:
-        log.info("즉시 실행: 손경제 브리핑")
-        asyncio.run(run_soneconomy(is_retry=True))
     elif "--asia" in sys.argv:
         log.info("즉시 실행: 아시아 브리핑")
         asyncio.run(run_asia())
     elif "--digest" in sys.argv:
         log.info("즉시 실행: 주간 다이제스트")
         asyncio.run(run_weekly_digest())
+    elif "--board" in sys.argv:
+        log.info("즉시 실행: 주간 스코어보드")
+        asyncio.run(run_scoreboard())
     else:
         asyncio.run(main())
