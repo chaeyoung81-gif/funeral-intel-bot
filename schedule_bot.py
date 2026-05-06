@@ -1,285 +1,460 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-일정관리 봇 (schedule_bot.py)
-------------------------------
-기능:
-  1. 텍스트 메시지 → 자동 할 일 등록
-  2. 매일 저녁 9시 KST → 미완료 일정 알림
-  3. /완료 [번호 또는 텍스트] → 완료 처리
-  4. /목록 → 현재 할 일 목록
-  5. 로컬 todos.json에 저장
-
-봇 토큰: schedule_bot 전용
+하루 마무리 봇 (Check-in Bot)
+- 매일 21:00 KST에 채영님에게 "오늘 어땠어?" 질문
+- 답변을 노션 DB에 저장
+- 누적/연속 일수 카운트
+- 일요일 21:30에 주간 관찰 자동 발송
+- 매월 1일 21:30에 월간 회고 자동 발송
+- 7/30/60/100일 마일스톤 알림
 """
 
+import os
+import logging
 import asyncio
 import json
-import logging
-import re
-import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
+from notion_client import Client as NotionClient
+from anthropic import Anthropic
 
+# === 설정 ===
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# 설정
-# ---------------------------------------------------------------------------
-SCHEDULE_BOT_TOKEN = "8640988207:AAEbTQzcZjPaA7YVQLiw7O2wrHy5ZXXZ8RA"
-KST = ZoneInfo("Asia/Seoul")
-BASE_DIR = Path(__file__).parent
-TODO_FILE = BASE_DIR / "todos.json"
-CHAT_IDS_FILE = BASE_DIR / "schedule_chat_ids.json"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_CHECKIN_BOT_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+NOTION_DB_ID = os.getenv("NOTION_CHECKIN_DB_ID")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 
+# 한국 시간대
+KST = timezone(timedelta(hours=9))
+
+# 알림 시간
+DAILY_TIME = (21, 0)        # 21:00 KST 매일 질문
+WEEKLY_TIME = (21, 30)      # 일요일 21:30 KST 주간 관찰
+MONTHLY_TIME = (21, 30)     # 매월 1일 21:30 KST 월간 회고
+
+# 상태 파일
+STATE_FILE = Path(__file__).parent / "checkin_state.json"
+
+# 로깅
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler(BASE_DIR / "schedule.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
 )
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# 데이터 관리
-# ---------------------------------------------------------------------------
-def load_todos() -> list[dict]:
-    """todos.json 로드. 없으면 빈 리스트."""
-    try:
-        if TODO_FILE.exists():
-            return json.loads(TODO_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error(f"todos 로드 실패: {e}")
-    return []
+# 클라이언트
+notion = NotionClient(auth=NOTION_API_KEY)
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def save_todos(todos: list[dict]) -> None:
-    TODO_FILE.write_text(
-        json.dumps(todos, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def load_chat_ids() -> set[int]:
-    """알림 수신 채팅 ID 목록 로드."""
-    try:
-        if CHAT_IDS_FILE.exists():
-            return set(json.loads(CHAT_IDS_FILE.read_text(encoding="utf-8")))
-    except Exception:
-        pass
-    return set()
-
-
-def save_chat_ids(ids: set[int]) -> None:
-    CHAT_IDS_FILE.write_text(
-        json.dumps(list(ids), ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def pending_todos(todos: list[dict]) -> list[dict]:
-    """완료되지 않은 항목만 반환 (인덱스 유지)."""
-    return [t for t in todos if not t.get("completed")]
-
-
-def format_todo_list(todos: list[dict]) -> str:
-    """미완료 항목을 번호 포함 텍스트로 포맷."""
-    items = pending_todos(todos)
-    if not items:
-        return "✅ 할 일이 없습니다!"
-    lines = ["📋 *할 일 목록*\n"]
-    # 전체 리스트에서 번호를 매겨야 /완료 1 등이 직관적
-    pending_indexed = [(i + 1, t) for i, t in enumerate(todos) if not t.get("completed")]
-    for seq, (num, t) in enumerate(pending_indexed, 1):
-        created = t.get("created_at", "")[:10]
-        lines.append(f"{seq}\\. {t['text']}  _{created}_")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# 핸들러
-# ---------------------------------------------------------------------------
-async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """일반 텍스트 → 할 일 등록."""
-    chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
-
-    if not text:
-        return
-
-    # 채팅 ID 저장 (알림 수신 대상)
-    ids = load_chat_ids()
-    if chat_id not in ids:
-        ids.add(chat_id)
-        save_chat_ids(ids)
-
-    todo = {
-        "id": str(uuid.uuid4()),
-        "text": text,
-        "created_at": datetime.now(KST).isoformat(),
-        "completed": False,
-        "completed_at": None,
+# === 상태 관리 ===
+def load_state():
+    """상태 파일 로드. 없으면 기본값."""
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "last_record_date": None,      # 마지막 기록 날짜 (YYYY-MM-DD)
+        "total_days": 0,                # 누적 일수
+        "streak_days": 0,               # 연속 일수
+        "awaiting_answer": False,       # 질문 던지고 답 기다리는 중인지
+        "today_question_date": None,    # 오늘 질문 날짜
     }
 
-    todos = load_todos()
-    todos.append(todo)
-    save_todos(todos)
 
-    pending = pending_todos(todos)
-    seq = len(pending)  # 방금 추가됐으므로 마지막 순서
-    await update.message.reply_text(
-        f"✅ 할 일이 등록됐습니다\\!\n\n*{seq}\\. {_esc(text)}*\n\n"
-        f"현재 미완료 항목: {len(pending)}개",
-        parse_mode="MarkdownV2",
-    )
-    logger.info(f"할 일 추가: {text}")
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-async def handle_wanryo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/완료 [번호 또는 텍스트] → 완료 처리."""
-    text = (update.message.text or "").strip()
-    # '/완료' 뒤 인자 파싱
-    arg = re.sub(r"^/완료\s*", "", text).strip()
-
-    todos = load_todos()
-    pending = [(i, t) for i, t in enumerate(todos) if not t.get("completed")]
-
-    if not pending:
-        await update.message.reply_text("✅ 완료할 항목이 없습니다!")
-        return
-
-    if not arg:
-        # 인자 없으면 목록 안내
-        lines = ["완료할 항목 번호나 텍스트를 입력하세요.\n", "/완료 1  또는  /완료 장보기\n"]
-        for seq, (_, t) in enumerate(pending, 1):
-            lines.append(f"{seq}. {t['text']}")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    matched_idx = None
-
-    # 숫자면 순번으로 처리
-    if arg.isdigit():
-        seq = int(arg) - 1
-        if 0 <= seq < len(pending):
-            matched_idx, matched_todo = pending[seq]
-        else:
-            await update.message.reply_text(f"❌ {arg}번 항목이 없습니다. (미완료: {len(pending)}개)")
-            return
-    else:
-        # 텍스트 포함 검색 (대소문자 무시)
-        arg_lower = arg.lower()
-        for orig_idx, t in pending:
-            if arg_lower in t["text"].lower():
-                matched_idx = orig_idx
-                matched_todo = t
-                break
-        if matched_idx is None:
-            await update.message.reply_text(f"❌ '{arg}'과 일치하는 항목을 찾지 못했습니다.")
-            return
-
-    todos[matched_idx]["completed"] = True
-    todos[matched_idx]["completed_at"] = datetime.now(KST).isoformat()
-    save_todos(todos)
-
-    remaining = len(pending_todos(todos))
-    await update.message.reply_text(
-        f"✅ 완료 처리됐습니다\\!\n\n~~{_esc(matched_todo['text'])}~~\n\n"
-        f"남은 항목: {remaining}개",
-        parse_mode="MarkdownV2",
-    )
-    logger.info(f"완료 처리: {matched_todo['text']}")
-
-
-async def handle_mokrok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/목록 → 현재 할 일 목록."""
-    # 채팅 ID 저장
-    chat_id = update.effective_chat.id
-    ids = load_chat_ids()
-    if chat_id not in ids:
-        ids.add(chat_id)
-        save_chat_ids(ids)
-
-    todos = load_todos()
-    msg = format_todo_list(todos)
+# === 노션 ===
+def save_to_notion(date_str, today_text, tomorrow_text, extra_text, total, streak):
+    """노션 DB에 한 줄 추가."""
+    title = f"{date_str}"
+    
+    properties = {
+        "일일 기록": {
+            "title": [{"text": {"content": title}}]
+        },
+        "날짜": {
+            "date": {"start": date_str}
+        },
+        "오늘": {
+            "rich_text": [{"text": {"content": today_text or ""}}]
+        },
+        "내일": {
+            "rich_text": [{"text": {"content": tomorrow_text or ""}}]
+        },
+        "추가 메모": {
+            "rich_text": [{"text": {"content": extra_text or ""}}]
+        },
+        "누적일수": {
+            "number": total
+        },
+        "연속일수": {
+            "number": streak
+        },
+    }
+    
     try:
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
-    except Exception:
-        await update.message.reply_text(msg.replace("\\", "").replace("*", "").replace("_", ""))
+        notion.pages.create(
+            parent={"database_id": NOTION_DB_ID},
+            properties=properties,
+        )
+        logger.info(f"노션 저장 완료: {date_str}")
+        return True
+    except Exception as e:
+        logger.error(f"노션 저장 실패: {e}")
+        return False
 
 
-# ---------------------------------------------------------------------------
-# 저녁 9시 알림
-# ---------------------------------------------------------------------------
-async def send_evening_reminder(bot) -> None:
-    """매일 21:00 KST — 미완료 항목 알림."""
-    todos = load_todos()
-    items = pending_todos(todos)
-    if not items:
-        logger.info("저녁 알림: 미완료 없음")
-        return
-
-    today_str = datetime.now(KST).strftime("%m월 %d일")
-    lines = [f"🌙 *{today_str} 저녁 9시 알림*\n", f"오늘 아직 못 한 일이 {len(items)}개 있어요\\!\n"]
-    for seq, t in enumerate(items, 1):
-        lines.append(f"{seq}\\. {_esc(t['text'])}")
-    lines.append("\n/완료 \\[번호\\] 로 완료 처리하세요\\.")
-    msg = "\n".join(lines)
-
-    ids = load_chat_ids()
-    for chat_id in ids:
-        try:
-            await bot.send_message(chat_id=chat_id, text=msg, parse_mode="MarkdownV2")
-            logger.info(f"저녁 알림 전송: chat_id={chat_id}, 미완료={len(items)}개")
-        except Exception as e:
-            logger.error(f"저녁 알림 실패 (chat_id={chat_id}): {e}")
-
-
-# ---------------------------------------------------------------------------
-# 유틸
-# ---------------------------------------------------------------------------
-def _esc(text: str) -> str:
-    """MarkdownV2 이스케이프."""
-    special = r"\_*[]()~`>#+-=|{}.!"
-    return "".join(f"\\{c}" if c in special else c for c in text)
+def update_notion_extra(date_str, extra_text):
+    """오늘 기록에 추가 메모 누적."""
+    try:
+        results = notion.databases.query(
+            database_id=NOTION_DB_ID,
+            filter={
+                "property": "날짜",
+                "date": {"equals": date_str}
+            }
+        )
+        if not results["results"]:
+            return False
+        page_id = results["results"][0]["id"]
+        existing = results["results"][0]["properties"]["추가 메모"]["rich_text"]
+        existing_text = existing[0]["text"]["content"] if existing else ""
+        new_text = f"{existing_text}\n{extra_text}" if existing_text else extra_text
+        
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "추가 메모": {
+                    "rich_text": [{"text": {"content": new_text}}]
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        logger.error(f"노션 메모 업데이트 실패: {e}")
+        return False
 
 
-# ---------------------------------------------------------------------------
-# 메인
-# ---------------------------------------------------------------------------
-async def main() -> None:
-    app = Application.builder().token(SCHEDULE_BOT_TOKEN).build()
+def fetch_recent_records(days):
+    """최근 N일 기록 가져오기."""
+    today = datetime.now(KST).date()
+    start_date = today - timedelta(days=days)
+    try:
+        results = notion.databases.query(
+            database_id=NOTION_DB_ID,
+            filter={
+                "property": "날짜",
+                "date": {"on_or_after": start_date.isoformat()}
+            },
+            sorts=[{"property": "날짜", "direction": "ascending"}]
+        )
+        records = []
+        for page in results["results"]:
+            props = page["properties"]
+            date = props["날짜"]["date"]["start"] if props["날짜"]["date"] else ""
+            today_text = props["오늘"]["rich_text"][0]["text"]["content"] if props["오늘"]["rich_text"] else ""
+            tomorrow_text = props["내일"]["rich_text"][0]["text"]["content"] if props["내일"]["rich_text"] else ""
+            extra_text = props["추가 메모"]["rich_text"][0]["text"]["content"] if props["추가 메모"]["rich_text"] else ""
+            records.append({
+                "date": date,
+                "today": today_text,
+                "tomorrow": tomorrow_text,
+                "extra": extra_text,
+            })
+        return records
+    except Exception as e:
+        logger.error(f"노션 조회 실패: {e}")
+        return []
 
-    # 한글 명령어: Regex 필터로 처리 (CommandHandler는 영문만 지원)
-    app.add_handler(MessageHandler(filters.Regex(r"^/완료"), handle_wanryo))
-    app.add_handler(MessageHandler(filters.Regex(r"^/목록"), handle_mokrok))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add))
 
-    # 스케줄러: 매일 21:00 KST
-    scheduler = AsyncIOScheduler(timezone=KST)
-    scheduler.add_job(
-        send_evening_reminder,
-        trigger="cron",
-        hour=21,
-        minute=0,
-        args=[app.bot],
+# === Claude 분석 ===
+def analyze_with_claude(records, period_label):
+    """Claude로 패턴 관찰 + 맥락 연결."""
+    if not records:
+        return None
+    
+    records_text = "\n\n".join([
+        f"[{r['date']}]\n오늘: {r['today']}\n내일: {r['tomorrow']}\n메모: {r['extra']}"
+        for r in records
+    ])
+    
+    prompt = f"""다음은 채영님의 {period_label} 하루 마무리 기록이야.
+
+{records_text}
+
+이 기록을 보고 채영님에게 짧게 알려줘. 톤은 평가 아니라 관찰자의 시선이야. 친한 친구가 옆에서 같이 봐주는 느낌으로.
+
+다음 구조로:
+1. 이번 {period_label} 관찰 (3-4줄): 반복된 단어, 컨디션 흐름, 눈에 띄는 패턴
+2. 맥락 연결 (2-3줄): 그 패턴이 어떤 맥락에서 나왔는지, 채영님이 이미 가진 정보로 더 나은 선택을 할 수 있는 힌트
+
+규칙:
+- 칭찬도 자책도 아닌 담백한 톤
+- "~하면 좋겠다" 같은 조언은 가볍게, 강요 X
+- 채영님이 이미 알 만한 것은 짧게만
+- 짧고 가독성 좋게. 줄바꿈 적절히
+- 마크다운 강조 표시(**) 쓰지 말 것
+- 텔레그램에서 자연스럽게 읽히게"""
+    
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        logger.error(f"Claude 분석 실패: {e}")
+        return None
+
+
+# === 텔레그램 핸들러 ===
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "안녕 채영. 매일 밤 9시에 하루 어땠는지 물어볼게.\n"
+        "라이딩 중이면 짧게, 여유 있으면 길게 답해도 돼.\n\n"
+        "/status - 누적/연속 일수 보기\n"
+        "/recap7 - 최근 7일 회고\n"
+        "/recap30 - 최근 30일 회고\n"
+        "/test - 지금 바로 질문 받아보기"
     )
-    scheduler.start()
-    logger.info("스케줄러 시작 (매일 21:00 KST 알림)")
 
-    async with app:
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.info("일정관리 봇 시작. Ctrl+C로 종료.")
-        await asyncio.Event().wait()  # 영구 대기
-        await app.updater.stop()
-        await app.stop()
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    msg = (
+        f"누적 {state['total_days']}일 / 연속 {state['streak_days']}일\n"
+        f"마지막 기록: {state['last_record_date'] or '아직 없음'}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """테스트용 - 지금 질문 던지기."""
+    await send_daily_question(context.application)
+
+
+async def cmd_recap7(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_recap(context.application, days=7, label="지난 7일")
+
+
+async def cmd_recap30(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_recap(context.application, days=30, label="지난 30일")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """일반 메시지 처리 - 답변 받기."""
+    if update.message.chat_id != CHAT_ID:
+        return
+    
+    text = update.message.text.strip()
+    if not text:
+        return
+    
+    state = load_state()
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    
+    # 이미 오늘 기록한 경우 → 추가 메모로 누적
+    if state["last_record_date"] == today_str:
+        ok = update_notion_extra(today_str, text)
+        if ok:
+            await update.message.reply_text("그것도 같이 적어둘게. 모르는 채로 둬도 괜찮아.")
+        else:
+            await update.message.reply_text("저장이 잘 안 됐어. 잠시 후 다시 시도해봐.")
+        return
+    
+    # 답변 대기 중이거나 그냥 자발적 메시지 → 새 기록
+    today_text, tomorrow_text = parse_answer(text)
+    
+    # 누적/연속 카운트 업데이트
+    yesterday_str = (datetime.now(KST).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    new_total = state["total_days"] + 1
+    if state["last_record_date"] == yesterday_str:
+        new_streak = state["streak_days"] + 1
+    else:
+        new_streak = 1
+    
+    ok = save_to_notion(today_str, today_text, tomorrow_text, "", new_total, new_streak)
+    
+    if ok:
+        state["last_record_date"] = today_str
+        state["total_days"] = new_total
+        state["streak_days"] = new_streak
+        state["awaiting_answer"] = False
+        save_state(state)
+        
+        # 응답
+        reply = f"기록됐어. (누적 {new_total}일 / 연속 {new_streak}일"
+        if new_streak in [7, 30, 60, 100]:
+            reply += f" 🎉)"
+            await update.message.reply_text(reply)
+            await asyncio.sleep(1)
+            await send_milestone(context.application, new_streak)
+        else:
+            reply += ")"
+            await update.message.reply_text(reply)
+    else:
+        await update.message.reply_text("저장이 잘 안 됐어. 다시 시도해줘.")
+
+
+def parse_answer(text):
+    """답변에서 '오늘'과 '내일' 부분을 분리. 단순한 휴리스틱."""
+    if "내일" in text:
+        idx = text.find("내일")
+        today = text[:idx].strip().rstrip(".,;").strip()
+        tomorrow = text[idx:].strip()
+        return today, tomorrow
+    return text, ""
+
+
+# === 자동 발송 ===
+async def send_daily_question(app):
+    """매일 21:00 KST 질문 발송."""
+    state = load_state()
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    
+    # 오늘 이미 기록했으면 패스
+    if state["last_record_date"] == today_str:
+        logger.info(f"{today_str} 이미 기록됨. 질문 발송 스킵.")
+        return
+    
+    # 빠진 날 다음 처리
+    last = state["last_record_date"]
+    if last:
+        last_date = datetime.strptime(last, "%Y-%m-%d").date()
+        today_date = datetime.now(KST).date()
+        gap = (today_date - last_date).days
+        if gap >= 2:
+            msg = f"채영, {gap}일만에 돌아왔네. 오늘 어땠어? 그리고 내일은 뭐가 있어?"
+        else:
+            msg = "채영, 오늘 어땠어? 그리고 내일은 뭐가 있어?"
+    else:
+        msg = "채영, 오늘 어땠어? 그리고 내일은 뭐가 있어?"
+    
+    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    state["awaiting_answer"] = True
+    state["today_question_date"] = today_str
+    save_state(state)
+    logger.info(f"일일 질문 발송: {today_str}")
+
+
+async def send_recap(app, days, label):
+    """회고 발송."""
+    records = fetch_recent_records(days)
+    if not records:
+        await app.bot.send_message(chat_id=CHAT_ID, text=f"{label} 기록이 아직 없어.")
+        return
+    
+    analysis = analyze_with_claude(records, label)
+    if analysis:
+        msg = f"📋 {label} 관찰\n\n{analysis}"
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    else:
+        await app.bot.send_message(chat_id=CHAT_ID, text="분석이 잘 안 됐어. 잠시 후 다시 시도해봐.")
+
+
+async def send_milestone(app, streak):
+    """7/30/60/100일 마일스톤."""
+    if streak == 7:
+        msg = "채영, 7일 연속이야 🎉\n첫 일주일 마쳤다."
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    elif streak == 30:
+        msg = "채영, 30일 연속 기록 🎉\n한 달간의 흐름을 같이 살펴볼래?"
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+        await asyncio.sleep(1)
+        await send_recap(app, days=30, label="지난 한 달")
+    elif streak == 60:
+        msg = "채영, 60일이야. 두 달 누적됐어 🎉"
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    elif streak == 100:
+        msg = "채영, 100일 연속이야 🎉🎉🎉\n100일 누적된 채영님의 흐름을 같이 보자."
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+        await asyncio.sleep(1)
+        await send_recap(app, days=100, label="지난 100일")
+
+
+async def send_weekly(app):
+    """일요일 주간 관찰."""
+    today = datetime.now(KST)
+    if today.weekday() != 6:  # 6 = Sunday
+        return
+    await send_recap(app, days=7, label="이번 주")
+
+
+async def send_monthly(app):
+    """매월 1일 월간 회고."""
+    today = datetime.now(KST)
+    if today.day != 1:
+        return
+    await send_recap(app, days=30, label="지난 한 달")
+
+
+# === 스케줄러 ===
+async def scheduler(app):
+    """매분 체크해서 정해진 시간에 작업 실행."""
+    last_run_daily = None
+    last_run_weekly = None
+    last_run_monthly = None
+    
+    while True:
+        try:
+            now = datetime.now(KST)
+            current_date = now.date().isoformat()
+            
+            # 일일 질문 (21:00)
+            if (now.hour, now.minute) == DAILY_TIME and last_run_daily != current_date:
+                await send_daily_question(app)
+                last_run_daily = current_date
+            
+            # 주간 관찰 (일요일 21:30)
+            if (now.hour, now.minute) == WEEKLY_TIME and now.weekday() == 6 and last_run_weekly != current_date:
+                await send_weekly(app)
+                last_run_weekly = current_date
+            
+            # 월간 회고 (매월 1일 21:30)
+            if (now.hour, now.minute) == MONTHLY_TIME and now.day == 1 and last_run_monthly != current_date:
+                await send_monthly(app)
+                last_run_monthly = current_date
+            
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"스케줄러 오류: {e}")
+            await asyncio.sleep(60)
+
+
+# === 메인 ===
+async def post_init(app):
+    """봇 시작 후 스케줄러 백그라운드 시작."""
+    asyncio.create_task(scheduler(app))
+    logger.info("스케줄러 시작됨.")
+
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("recap7", cmd_recap7))
+    app.add_handler(CommandHandler("recap30", cmd_recap30))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    logger.info("하루 마무리 봇 시작.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
