@@ -1,0 +1,702 @@
+"""
+shopping-bot: 장보기 알림 + 기록 봇
+- /장보기: 장소 선택 → 품목 토글 → 마감일 → 등록
+- /목록: 등록된 항목 조회
+- 마감일 당일 10시/20시 알림, 미완료 시 다음날 이월
+- 완료 시 비고 입력 후 history.xlsx 기록
+"""
+
+import json
+import logging
+import os
+from datetime import datetime, date, time, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+import gspread
+from google.oauth2.service_account import Credentials
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+# ============================================================
+# 설정
+# ============================================================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MY_CHAT_ID = int(os.getenv("MY_CHAT_ID"))
+SHEET_ID = os.getenv("SHEET_ID")
+KST = ZoneInfo("Asia/Seoul")
+
+BASE_DIR = Path(__file__).parent
+CREDS_FILE = BASE_DIR / "credentials.json"
+PENDING_FILE = BASE_DIR / "pending.json"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# 카테고리별 기본 품목
+CATEGORIES = {
+    "마트": ["콩나물", "두부", "바나나", "팽이버섯", "고구마", "감자"],
+    "쿠팡": ["오트밀", "냉동블루베리", "냉동감자", "동태", "냉동망고"],
+    "기타": [],
+}
+
+# 마감일 옵션
+DUE_OPTIONS = [
+    ("오늘", 0),
+    ("내일", 1),
+    ("3일 후", 3),
+    ("일주일 후", 7),
+]
+
+# ConversationHandler 상태
+WAITING_NOTE = 1
+WAITING_CUSTOM_ITEM = 2
+WAITING_CUSTOM_PLACE = 3
+WAITING_CUSTOM_FULL = 4
+WAITING_LIST_NOTE = 5
+# ============================================================
+# 데이터 저장/로드
+# ============================================================
+def load_pending() -> list:
+    if PENDING_FILE.exists():
+        return json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+    return []
+
+
+def save_pending(items: list) -> None:
+    PENDING_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+_sheet_cache = None
+
+def get_sheet():
+    """구글 시트 객체 반환 (한 번만 인증)"""
+    global _sheet_cache
+    if _sheet_cache is None:
+        creds = Credentials.from_service_account_file(str(CREDS_FILE), scopes=SCOPES)
+        client = gspread.authorize(creds)
+        _sheet_cache = client.open_by_key(SHEET_ID).worksheet("장보기기록")
+    return _sheet_cache
+
+
+def append_history(row: dict) -> None:
+    """완료된 장보기 기록을 구글 시트에 추가"""
+    try:
+        sheet = get_sheet()
+        sheet.append_row([
+            row["completed_at"],
+            row["place"],
+            row["item"],
+            row["due_date"],
+            row.get("postpone_count", 0),
+            row.get("note", ""),
+        ])
+    except Exception as e:
+        logger.error(f"시트 저장 실패: {e}")
+        # 실패해도 봇은 죽지 않음
+
+# ============================================================
+# 헬퍼
+# ============================================================
+def today_kst() -> date:
+    return datetime.now(KST).date()
+
+
+def already_pending_items(place: str) -> set:
+    return {p["item"] for p in load_pending() if p["place"] == place}
+
+
+def make_id() -> str:
+    return datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+
+
+# ============================================================
+# /장보기 — 장소 선택
+# ============================================================
+async def cmd_shop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🛒 마트", callback_data="place|마트")],
+        [InlineKeyboardButton("📦 쿠팡", callback_data="place|쿠팡")],
+        [InlineKeyboardButton("✏️ 기타 (직접 입력)", callback_data="place|기타")],
+    ]
+    await update.message.reply_text(
+        "어디서 살까요?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return 0
+
+async def on_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    place = query.data.split("|")[1]
+
+    if place == "기타":
+        await query.edit_message_text(
+            "장소와 품목을 입력하세요.\n"
+            "형식: 장소 - 품목1, 품목2\n"
+            "예시: 약국 - 마스크, 밴드"
+        )
+        return WAITING_CUSTOM_FULL
+    ctx.user_data["place"] = place
+    ctx.user_data["selected"] = set()
+    await show_item_menu(query, ctx)
+    return ConversationHandler.END
+
+
+async def on_custom_full_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """기타 장소 + 품목을 한 번에 입력받기"""
+    text = update.message.text.strip()
+    if "-" not in text:
+        await update.message.reply_text(
+            "형식이 안 맞아요. 예: 약국 - 마스크, 밴드\n다시 입력해주세요."
+        )
+        return WAITING_CUSTOM_FULL
+
+    place_part, items_part = text.split("-", 1)
+    place = place_part.strip()
+    items = [s.strip() for s in items_part.split(",") if s.strip()]
+
+    if not place or not items:
+        await update.message.reply_text(
+            "장소나 품목이 비었어요. 다시 입력해주세요."
+        )
+        return WAITING_CUSTOM_FULL
+
+    ctx.user_data["place"] = place
+    ctx.user_data["selected"] = set(items)
+
+    keyboard = [[InlineKeyboardButton(label, callback_data=f"due|{days}")]
+                for label, days in DUE_OPTIONS]
+    keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="cancel")])
+    await update.message.reply_text(
+        f"📍 {place}\n📦 {', '.join(items)}\n\n언제까지?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ConversationHandler.END
+
+# ============================================================
+# 품목 토글 메뉴
+# ============================================================
+async def show_item_menu(query, ctx):
+    place = ctx.user_data["place"]
+    selected = ctx.user_data.get("selected", set())
+    existing = already_pending_items(place)
+
+    keyboard = []
+    items = CATEGORIES.get(place, [])
+    for item in items:
+        if item in existing:
+            label = f"⚪ {item} (등록됨)"
+            cb = "noop"
+        elif item in selected:
+            label = f"✅ {item}"
+            cb = f"toggle|{item}"
+        else:
+            label = f"⬜ {item}"
+            cb = f"toggle|{item}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+
+    # 사용자가 직접 추가한 품목들도 표시
+    for item in selected:
+        if item not in items:
+            keyboard.append([InlineKeyboardButton(f"✅ {item} (직접입력)", callback_data=f"toggle|{item}")])
+
+    keyboard.append([InlineKeyboardButton("✏️ 품목 직접 입력", callback_data="custom_item")])
+    if selected:
+        keyboard.append([InlineKeyboardButton(f"➡️ 다음 ({len(selected)}개)", callback_data="next_due")])
+    keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="cancel")])
+
+    text = f"📍 {place} — 살 것 선택\n(여러 개 토글 가능)"
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def on_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    item = query.data.split("|")[1]
+    selected = ctx.user_data.setdefault("selected", set())
+    if item in selected:
+        selected.remove(item)
+    else:
+        selected.add(item)
+    await show_item_menu(query, ctx)
+
+
+async def on_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("이미 등록된 항목입니다", show_alert=False)
+
+
+async def on_custom_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("품목 이름을 입력해주세요. (쉼표로 여러 개 가능: 양배추, 우유)")
+    return WAITING_CUSTOM_ITEM
+
+
+async def on_custom_item_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    items = [s.strip() for s in text.split(",") if s.strip()]
+    selected = ctx.user_data.setdefault("selected", set())
+    for item in items:
+        selected.add(item)
+
+    place = ctx.user_data["place"]
+    keyboard = [[InlineKeyboardButton(f"➡️ 다음 ({len(selected)}개)", callback_data="next_due")]]
+    keyboard.append([InlineKeyboardButton("✏️ 더 추가", callback_data="custom_item")])
+    keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="cancel")])
+    await update.message.reply_text(
+        f"📍 {place} — 선택됨: {', '.join(sorted(selected))}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ConversationHandler.END
+
+
+# ============================================================
+# 마감일 선택
+# ============================================================
+async def on_next_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    selected = ctx.user_data.get("selected", set())
+    if not selected:
+        await query.answer("선택된 품목이 없습니다", show_alert=True)
+        return
+
+    keyboard = [[InlineKeyboardButton(label, callback_data=f"due|{days}")]
+                for label, days in DUE_OPTIONS]
+    keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="cancel")])
+    await query.edit_message_text(
+        f"언제까지?\n품목: {', '.join(sorted(selected))}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    days = int(query.data.split("|")[1])
+    due_date = today_kst() + timedelta(days=days)
+
+    place = ctx.user_data["place"]
+    selected = ctx.user_data.get("selected", set())
+
+    pending = load_pending()
+    for item in selected:
+        pending.append({
+            "id": make_id(),
+            "place": place,
+            "item": item,
+            "due_date": due_date.isoformat(),
+            "postpone_count": 0,
+            "completed_at_morning_today": None,
+        })
+    save_pending(pending)
+
+    ctx.user_data.clear()
+    await query.edit_message_text(
+        f"✓ 등록 완료\n📍 {place}\n📦 {', '.join(sorted(selected))}\n📅 ~{due_date.isoformat()}"
+    )
+
+
+async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data.clear()
+    await query.edit_message_text("취소됨")
+
+
+# ============================================================
+# /목록
+# ============================================================
+def build_list_keyboard(pending: list, selected: set) -> InlineKeyboardMarkup:
+    """리스트 토글 + 전부 + 완료 버튼"""
+    keyboard = []
+    for p in pending:
+        mark = "✅" if p["id"] in selected else "⬜"
+        keyboard.append([InlineKeyboardButton(
+            f"{mark} {p['item']} ({p['place']})",
+            callback_data=f"pick|{p['id']}",
+        )])
+    all_ids = {p["id"] for p in pending}
+    all_marked = "✅" if selected == all_ids and all_ids else "⬜"
+    keyboard.append([InlineKeyboardButton(f"{all_marked} 전부", callback_data="pick_all")])
+    if selected:
+        keyboard.append([InlineKeyboardButton(
+            f"✓ 선택 완료 ({len(selected)}개)",
+            callback_data="finish_pick",
+        )])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def format_list_text(pending: list) -> str:
+    today = today_kst()
+    lines = ["📋 장보기 목록\n"]
+    by_place = {}
+    for p in pending:
+        by_place.setdefault(p["place"], []).append(p)
+    for place, items in by_place.items():
+        lines.append(f"📍 {place}")
+        for p in items:
+            due = date.fromisoformat(p["due_date"])
+            diff = (due - today).days
+            if diff < 0:
+                icon, when = "🔴", f"{-diff}일 지남"
+            elif diff == 0:
+                icon, when = "🔴", "오늘까지"
+            elif diff == 1:
+                icon, when = "🟡", "내일까지"
+            else:
+                icon, when = "⚪", f"{diff}일 남음"
+            lines.append(f"  {icon} {p['item']} — {when}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pending = load_pending()
+    if not pending:
+        await update.message.reply_text("등록된 항목이 없습니다.")
+        return
+    pending.sort(key=lambda p: p["due_date"])
+    ctx.chat_data["pick_selected"] = set()
+    await update.message.reply_text(
+        format_list_text(pending),
+        reply_markup=build_list_keyboard(pending, set()),
+    )
+
+
+
+async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    item_id = query.data.split("|")[1]
+    selected = ctx.chat_data.setdefault("pick_selected", set())
+    if item_id in selected:
+        selected.remove(item_id)
+    else:
+        selected.add(item_id)
+    pending = load_pending()
+    pending.sort(key=lambda p: p["due_date"])
+    await query.edit_message_reply_markup(
+        reply_markup=build_list_keyboard(pending, selected),
+    )
+
+
+async def on_pick_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pending = load_pending()
+    pending.sort(key=lambda p: p["due_date"])
+    all_ids = {p["id"] for p in pending}
+    selected = ctx.chat_data.setdefault("pick_selected", set())
+    if selected == all_ids:
+        selected.clear()
+    else:
+        selected.clear()
+        selected.update(all_ids)
+    await query.edit_message_reply_markup(
+        reply_markup=build_list_keyboard(pending, selected),
+    )
+async def on_finish_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    selected = ctx.chat_data.get("pick_selected", set())
+    if not selected:
+        await query.answer("선택된 항목이 없습니다", show_alert=True)
+        return
+    ctx.chat_data["awaiting_list_note"] = True
+    ctx.chat_data["completing_ids"] = list(selected)
+    pending = load_pending()
+    items_str = ", ".join(p["item"] for p in pending if p["id"] in selected)
+    await query.edit_message_text(
+        f"✓ 완료 처리: {items_str}\n\n비고를 입력하세요. (없으면 -)"
+    )
+
+async def on_list_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.chat_data.get("awaiting_list_note"):
+        return  # 이 메시지는 우리 게 아님
+
+    note = update.message.text.strip()
+    if note == "-":
+        note = ""
+
+    ids = ctx.chat_data.get("completing_ids", [])
+    pending = load_pending()
+    completed_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    completed_items = []
+    remaining = []
+    for p in pending:
+        if p["id"] in ids:
+            append_history({
+                "completed_at": completed_at,
+                "place": p["place"],
+                "item": p["item"],
+                "due_date": p["due_date"],
+                "postpone_count": p.get("postpone_count", 0),
+                "note": note,
+            })
+            completed_items.append(p["item"])
+        else:
+            remaining.append(p)
+    save_pending(remaining)
+
+    ctx.chat_data.pop("awaiting_list_note", None)
+    ctx.chat_data.pop("completing_ids", None)
+    ctx.chat_data.pop("pick_selected", None)
+
+    await update.message.reply_text(
+        f"✓ 기록 완료: {', '.join(completed_items)}"
+        + (f"\n📝 비고: {note}" if note else "")
+    )    # 완료 버튼 추가
+    keyboard = []
+    for p in pending:
+        keyboard.append([InlineKeyboardButton(
+            f"✓ {p['item']} ({p['place']})",
+            callback_data=f"done|{p['id']}",
+        )])
+    if len(pending) > 1:
+        keyboard.append([InlineKeyboardButton("✓ 전부 완료", callback_data="done_all")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+# ============================================================
+# 알림 (10시 / 20시)
+# ============================================================
+def build_alert_keyboard(items: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    for p in items:
+        keyboard.append([InlineKeyboardButton(
+            f"✓ {p['item']} ({p['place']})",
+            callback_data=f"done|{p['id']}",
+        )])
+    if len(items) > 1:
+        keyboard.append([InlineKeyboardButton("✓ 전부 완료", callback_data="done_all")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_alert(ctx: ContextTypes.DEFAULT_TYPE):
+    """오늘이 마감일인 항목 알림. 매일 10시 / 20시 실행."""
+    pending = load_pending()
+    today = today_kst()
+
+    # 마감일 지난 것은 자동으로 오늘로 이월 (정책 2.a)
+    changed = False
+    for p in pending:
+        due = date.fromisoformat(p["due_date"])
+        if due < today:
+            p["due_date"] = today.isoformat()
+            p["postpone_count"] = p.get("postpone_count", 0) + 1
+            changed = True
+    if changed:
+        save_pending(pending)
+
+    # 오늘 마감인 항목만
+    due_today = [p for p in pending if p["due_date"] == today.isoformat()]
+    if not due_today:
+        return
+
+    now = datetime.now(KST).strftime("%H:%M")
+    text = f"🔔 [{now}] 오늘 살 것\n\n"
+    by_place = {}
+    for p in due_today:
+        by_place.setdefault(p["place"], []).append(p["item"])
+    for place, items in by_place.items():
+        text += f"📍 {place}: {', '.join(items)}\n"
+
+    await ctx.bot.send_message(
+        chat_id=MY_CHAT_ID,
+        text=text,
+        reply_markup=build_alert_keyboard(due_today),
+    )
+
+
+# ============================================================
+# 완료 처리
+# ============================================================
+async def on_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    item_id = query.data.split("|")[1]
+
+    pending = load_pending()
+    target = next((p for p in pending if p["id"] == item_id), None)
+    if not target:
+        await query.edit_message_text("이미 처리됨")
+        return ConversationHandler.END
+
+    ctx.user_data["completing_ids"] = [item_id]
+    await query.edit_message_text(
+        f"✓ {target['item']} 완료!\n비고를 입력하세요. (없으면 -)"
+    )
+    return WAITING_NOTE
+
+
+async def on_done_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pending = load_pending()
+    today = today_kst().isoformat()
+    targets = [p for p in pending if p["due_date"] == today]
+    ids = [p["id"] for p in targets]
+    if not ids:
+        await query.edit_message_text("완료할 항목 없음")
+        return ConversationHandler.END
+
+    ctx.user_data["completing_ids"] = ids
+    items_str = ", ".join(p["item"] for p in targets)
+    await query.edit_message_text(
+        f"✓ 전부 완료! ({items_str})\n비고를 입력하세요. (없으면 -)"
+    )
+    return WAITING_NOTE
+
+
+async def on_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    note = update.message.text.strip()
+    if note == "-":
+        note = ""
+
+    ids = ctx.user_data.get("completing_ids", [])
+    pending = load_pending()
+    completed_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    completed_items = []
+    remaining = []
+    for p in pending:
+        if p["id"] in ids:
+            append_history({
+                "completed_at": completed_at,
+                "place": p["place"],
+                "item": p["item"],
+                "due_date": p["due_date"],
+                "postpone_count": p.get("postpone_count", 0),
+                "note": note,
+            })
+            completed_items.append(p["item"])
+        else:
+            remaining.append(p)
+    save_pending(remaining)
+
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        f"✓ 기록 완료: {', '.join(completed_items)}"
+        + (f"\n📝 비고: {note}" if note else "")
+    )
+    return ConversationHandler.END
+
+
+# ============================================================
+# /start, /help
+# ============================================================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛒 장보기 봇\n\n"
+        "/shop — 살 것 등록\n"
+        "/list — 등록된 항목 보기\n\n"
+        "마감일 당일 10시/20시에 알림이 와요."
+    )
+
+
+# ============================================================
+# 메인
+# ============================================================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # /장보기 → 장소 선택 (기타 시 텍스트 입력)
+    place_conv = ConversationHandler(
+        entry_points=[CommandHandler("shop", cmd_shop)],
+        states={
+            0: [CallbackQueryHandler(on_place, pattern=r"^place\|")],
+            WAITING_CUSTOM_FULL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_custom_full_text)],
+        },
+        fallbacks=[CommandHandler("cancel_cmd", on_cancel)],
+        per_message=False,
+    )
+    # 품목 직접 입력
+    custom_item_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_custom_item, pattern="^custom_item$")],
+        states={
+            WAITING_CUSTOM_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_custom_item_text)],
+        },
+        fallbacks=[CommandHandler("cancel_cmd", on_cancel)],
+        per_message=False,
+    )
+
+    # 완료 → 비고 입력
+    list_note_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_finish_pick, pattern="^finish_pick$")],
+        states={
+            WAITING_LIST_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_list_note_text)],
+        },
+        fallbacks=[CommandHandler("cancel_cmd", on_cancel)],
+        per_message=False,
+    )
+    note_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(on_done, pattern=r"^done\|"),
+            CallbackQueryHandler(on_done_all, pattern="^done_all$"),
+        ],
+        states={
+            WAITING_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_note_text)],
+        },
+        fallbacks=[CommandHandler("cancel_cmd", on_cancel)],
+        per_message=False,
+    )
+
+    app.add_handler(place_conv)
+    app.add_handler(custom_item_conv)
+    app.add_handler(CallbackQueryHandler(on_finish_pick, pattern="^finish_pick$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_list_note_text), group=1)
+    app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick\|"))
+    app.add_handler(CallbackQueryHandler(on_pick_all, pattern="^pick_all$"))
+    app.add_handler(note_conv)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("list", cmd_list))
+
+    app.add_handler(CallbackQueryHandler(on_toggle, pattern=r"^toggle\|"))
+    app.add_handler(CallbackQueryHandler(on_noop, pattern="^noop$"))
+    app.add_handler(CallbackQueryHandler(on_next_due, pattern="^next_due$"))
+    app.add_handler(CallbackQueryHandler(on_due, pattern=r"^due\|"))
+    app.add_handler(CallbackQueryHandler(on_cancel, pattern="^cancel$"))
+
+    # 알림 스케줄 (KST 10:00 / 20:00)
+    job_queue = app.job_queue
+    job_queue.run_daily(send_alert, time=time(10, 0, tzinfo=KST), name="morning_alert")
+    job_queue.run_daily(send_alert, time=time(20, 0, tzinfo=KST), name="evening_alert")
+
+    logger.info("Shopping bot started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+ubuntu@funeral-intel-server-2:~/shopping-bot$
+
+
