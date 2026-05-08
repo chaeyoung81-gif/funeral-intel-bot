@@ -1,3 +1,4 @@
+ ✅ 확인완료
 """
 KOSIS 통계 인프라 수집기 v3 (Funeral Intel Bot — Research)
 위치: funeral-intel-bot/research/01_market_observation/02_collector.py
