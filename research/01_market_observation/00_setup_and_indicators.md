@@ -1,3 +1,4 @@
+ ✅ 확인완료
 # 01_market_observation — KOSIS 통계 인프라 (Setup & Indicators)
 
 > 작성일: 2026-05-03 / 1차 버전  
